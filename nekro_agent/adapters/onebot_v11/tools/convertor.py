@@ -948,7 +948,10 @@ async def convert_chat_message(
                 )
 
         elif seg.type == "file":
-            if "size" in seg.data and seg.data["size"] > config.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+            # 不同协议端上报的字段名不一致（size / file_size），且可能为 None 或字符串，
+            # 直接比较会抛 TypeError，故统一归一化为 int
+            file_size = int(seg.data.get("size") or seg.data.get("file_size") or 0)
+            if file_size > config.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 file_name = seg.data.get("name", "unknown")
                 logger.warning(f"文件过大，跳过处理: {file_name}")
                 continue
