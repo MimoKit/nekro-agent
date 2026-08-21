@@ -18,6 +18,7 @@ from nekro_agent.adapters.interface import (
     collect_message,
 )
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
+from nekro_agent.adapters.onebot_v11.core.account_manager import is_account_enabled
 from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
     gen_chat_text,
@@ -53,8 +54,13 @@ def register_matcher(adapter: BaseAdapter):
     async def _(_: Matcher, event: Union[MessageEvent, GroupMessageEvent], bot: Bot):
         """消息匹配器"""
 
-        # 频道信息处理
-        channel_id, chat_type = await get_chat_info(event=event)
+        # 多账号：账号被停用时忽略其消息
+        if not await is_account_enabled(str(bot.self_id)):
+            logger.debug(f"账号 {bot.self_id} 已停用，忽略消息")
+            return
+
+        # 频道信息处理（channel_id 带账号作用域，实现多账号会话隔离）
+        channel_id, chat_type = await get_chat_info(event=event, self_id=str(bot.self_id))
         plt_channel: PlatformChannel = PlatformChannel(channel_id=channel_id, channel_name="", channel_type=chat_type)
         db_chat_channel: DBChatChannel = await plt_channel.get_db_chat_channel(adapter)
 
@@ -128,8 +134,12 @@ def register_matcher(adapter: BaseAdapter):
     @on_notice(priority=99999, block=False).handle()
     async def _(_: Matcher, event: GroupUploadNoticeEvent, bot: Bot):
         """上传事件匹配器"""
-        # 频道信息处理
-        channel_id, chat_type = await get_chat_info(event=event)
+        # 多账号：账号被停用时忽略其事件
+        if not await is_account_enabled(str(bot.self_id)):
+            return
+
+        # 频道信息处理（channel_id 带账号作用域）
+        channel_id, chat_type = await get_chat_info(event=event, self_id=str(bot.self_id))
         plt_channel: PlatformChannel = PlatformChannel(channel_id=channel_id, channel_name="", channel_type=chat_type)
         db_chat_channel: DBChatChannel = await plt_channel.get_db_chat_channel(adapter)
 

@@ -1071,8 +1071,11 @@ async def convert_chat_message(
 
 
 def get_channel_type(channel_id: str) -> ChatType:
+    from nekro_agent.adapters.onebot_v11.core.scoped_channel import strip_scope
+
     try:
-        chat_type, _ = channel_id.split("_")
+        # 多账号下 channel_id 可能带账号作用域前缀，需先剥离
+        chat_type, _ = strip_scope(channel_id).split("_")
         return ChatType(chat_type)
     except ValueError as e:
         raise ValueError(f"Invalid channel id: {channel_id}") from e

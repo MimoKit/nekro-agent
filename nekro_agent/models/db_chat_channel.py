@@ -211,12 +211,42 @@ class DBChatChannel(Model):
             logger.error(f"获取聊天频道类型失败: {e!s}")
             return ChatType.UNKNOWN
 
+    async def _get_account_default_preset_id(self) -> Optional[int]:
+        """获取该频道所属账号（适配器实例）的默认人设 ID
+
+        多账号适配器（如 OneBot V11 多 QQ 接入）可为每个账号设置独立的默认人设。
+        通过适配器钩子获取，避免核心模型硬依赖具体适配器实现。
+        """
+        try:
+            adapter = self.adapter
+        except Exception:  # noqa: BLE001 - 适配器未加载时静默跳过账号层
+            return None
+
+        resolver = getattr(adapter, "get_account_default_preset_id", None)
+        if resolver is None:
+            return None
+
+        try:
+            return await resolver(self.chat_key)
+        except Exception as e:  # noqa: BLE001 - 账号层解析失败不应阻断人设获取
+            logger.warning(f"获取账号级默认人设失败，回退全局默认: {self.chat_key}, {e!s}")
+            return None
+
     async def get_preset(self) -> Union[DBPreset, DefaultPreset]:
-        """获取人设"""
+        """获取人设
+
+        解析优先级: 频道人设 → 账号默认人设 → 全局默认人设 → 内置默认人设
+        """
         # 先尝试频道自身的 preset_id
         preset = await DBPreset.get_or_none(id=self.preset_id)
         if preset:
             return preset
+        # 再尝试账号（适配器实例）级默认人设
+        account_preset_id = await self._get_account_default_preset_id()
+        if account_preset_id is not None:
+            account_preset = await DBPreset.get_or_none(id=account_preset_id)
+            if account_preset:
+                return account_preset
         # 再尝试系统默认人设 ID
         if config.AI_CHAT_DEFAULT_PRESET_ID is not None:
             default_preset = await DBPreset.get_or_none(id=config.AI_CHAT_DEFAULT_PRESET_ID)

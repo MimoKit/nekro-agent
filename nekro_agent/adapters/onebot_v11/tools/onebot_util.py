@@ -1,5 +1,5 @@
 import json
-from typing import Tuple, Union, cast
+from typing import Optional, Tuple, Union, cast
 
 
 from nonebot.adapters import Bot
@@ -137,8 +137,15 @@ async def get_user_group_card_name(
 
 async def get_chat_info(
     event: Union[MessageEvent, GroupIncreaseNoticeEvent, GroupUploadNoticeEvent, NoticeEvent],
+    self_id: Optional[str] = None,
 ) -> Tuple[str, ChatType]:
-    """获取频道信息"""
+    """获取频道信息
+
+    Args:
+        event: OneBot 事件
+        self_id: 接收该事件的账号 QQ 号。传入时会写入 channel_id 作用域，
+            使多账号接入同一群时会话互相隔离；不传则沿用旧格式。
+    """
     if isinstance(event, (GroupUploadNoticeEvent, GroupIncreaseNoticeEvent, NoticeEvent)):
         raw_chat_type = "group"
     else:
@@ -155,6 +162,11 @@ async def get_chat_info(
     else:
         chat_type = ChatType.UNKNOWN
         raise ValueError("未知的消息类型")
+
+    if self_id:
+        from nekro_agent.adapters.onebot_v11.core.scoped_channel import build_channel_id
+
+        channel_id = build_channel_id(str(self_id), channel_id)
 
     return channel_id, chat_type
 

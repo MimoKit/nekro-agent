@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 from fastapi import APIRouter
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
@@ -27,6 +27,7 @@ from nekro_agent.services.command.schemas import CommandResponse
 
 from ..interface.base import AdapterMetadata, BaseAdapter, BaseAdapterConfig
 from .core.bot import get_bot
+from .core.scoped_channel import parse_channel_id
 from .tools.at_parser import SegAt, parse_at_from_text
 from .tools.cq_markup import neutralize_onebot_cq_at_all_markup
 from .tools.convertor import get_channel_type
@@ -196,8 +197,9 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             )
             return CommandPermission.USER
 
+        scoped_channel = parse_channel_id(platform_channel.channel_id)
         try:
-            group_id = int(platform_channel.channel_id.replace("group_", "", 1))
+            group_id = scoped_channel.target_id_int
             user_id = int(platform_user.user_id)
         except ValueError:
             logger.debug(
@@ -207,7 +209,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             return CommandPermission.USER
 
         try:
-            member_info = await get_bot().get_group_member_info(
+            member_info = await get_bot(scoped_channel.self_id).get_group_member_info(
                 group_id=group_id,
                 user_id=user_id,
                 no_cache=False,
@@ -242,8 +244,12 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
 
     def get_adapter_router(self) -> APIRouter:
         """获取适配器路由"""
-        from .routers import router
+        from .accounts_router import router as accounts_router
+        from .routers import router as container_router
 
+        router = APIRouter()
+        router.include_router(container_router)
+        router.include_router(accounts_router)
         return router
 
     async def init(self) -> None:
@@ -251,6 +257,50 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         from . import matchers
 
         register_matcher(self)
+        self._register_account_hooks()
+
+        # 载入 WebUI 标记的默认账号到内存缓存，供同步的 get_bot() 使用
+        from .core.account_manager import refresh_default_account_cache
+
+        try:
+            default_self_id = await refresh_default_account_cache()
+            if default_self_id:
+                logger.info(f"OneBot V11 默认账号: {default_self_id}")
+        except Exception as e:  # noqa: BLE001 - 缓存载入失败时回退到 BOT_QQ 配置
+            logger.warning(f"载入默认账号标记失败，将回退到 BOT_QQ 配置: {e}")
+
+    def _register_account_hooks(self) -> None:
+        """注册账号连接钩子，实现多账号自动登记与状态维护"""
+        import nonebot
+        from nonebot.adapters.onebot.v11 import Bot as OneBotV11Bot
+
+        from .core.account_manager import mark_offline, register_account, sync_online_states
+        from .core.bot import get_online_self_ids
+
+        @nonebot.get_driver().on_bot_connect
+        async def _(bot: OneBotV11Bot) -> None:
+            if not isinstance(bot, OneBotV11Bot):
+                return
+            try:
+                nickname = ""
+                try:
+                    login_info = await bot.get_login_info()
+                    nickname = str(login_info.get("nickname", "") or "")
+                except Exception as e:  # noqa: BLE001 - 昵称仅用于展示
+                    logger.debug(f"获取账号昵称失败: {e}")
+                await register_account(str(bot.self_id), display_name=nickname)
+                await sync_online_states(get_online_self_ids())
+            except Exception as e:  # noqa: BLE001 - 登记失败不应阻断接入
+                logger.error(f"账号自动登记失败 {bot.self_id}: {e}")
+
+        @nonebot.get_driver().on_bot_disconnect
+        async def _(bot: OneBotV11Bot) -> None:
+            if not isinstance(bot, OneBotV11Bot):
+                return
+            try:
+                await mark_offline(str(bot.self_id))
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"账号离线标记失败 {bot.self_id}: {e}")
 
     async def cleanup(self) -> None:
         """清理适配器"""
@@ -296,12 +346,20 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         else:
             return True
 
+    async def _resolve_target(self, chat_key: str) -> Tuple[Bot, ChatType, int]:
+        """从 chat_key 解析出「用哪个账号发」「发到哪」
+
+        多账号下必须按 channel_id 中的账号作用域选择对应的 Bot 实例，
+        否则消息可能从错误的 QQ 号发出。旧格式（无作用域）回退到默认账号。
+        """
+        db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
+        scoped = parse_channel_id(db_chat_channel.channel_id)
+        bot: Bot = get_bot(scoped.self_id)
+        return bot, db_chat_channel.chat_type, scoped.target_id_int
+
     async def _send_forward_message(self, chat_key: str, text: str) -> None:
         """以合并转发消息形式发送长文本，智能拆分段落"""
-        bot: Bot = get_bot()
-        db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
-        chat_type = db_chat_channel.chat_type
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        bot, chat_type, chat_id = await self._resolve_target(chat_key)
 
         # 智能拆分：优先按 ====== 分隔符，其次按双换行，最后按固定行数
         sections: List[str] = []
@@ -345,10 +403,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
 
     async def _send_forward_segments(self, chat_key: str, messages: list[AgentMessageSegment]) -> None:
         """以合并转发消息形式发送图文消息段。"""
-        bot: Bot = get_bot()
-        db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
-        chat_type = db_chat_channel.chat_type
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        bot, chat_type, chat_id = await self._resolve_target(chat_key)
 
         nodes: list[dict[str, Any]] = []
         current_message = Message()
@@ -475,9 +530,8 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
 
     async def _send_files(self, chat_key: str, file_segments: List) -> None:
         """发送文件（物化到 uploads 目录后通过 OneBot 文件上传 API 发送）"""
-        bot: Bot = get_bot()
+        bot, _chat_type, chat_id = await self._resolve_target(chat_key)
         db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
 
         from nekro_agent.tools.common_util import copy_to_upload_dir
 
@@ -521,14 +575,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
 
     async def _send_to_chat(self, chat_key: str, message: Message) -> str:
         """发送消息到指定聊天"""
-        bot: Bot = get_bot()
-
-        # 获取聊天频道信息
-        db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
-        chat_type = db_chat_channel.chat_type
-
-        # 从channel_id中提取真实的ID
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        bot, chat_type, chat_id = await self._resolve_target(chat_key)
 
         if chat_type is ChatType.GROUP:
             ret = await bot.send_group_msg(group_id=chat_id, message=message, auto_escape=self.config.RESOLVE_CQ_CODE)
@@ -541,7 +588,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         return str(ret.get("message_id", "")) or ""
 
     async def get_self_info(self) -> PlatformUser:
-        """获取自身信息"""
+        """获取自身信息（多账号下返回默认账号）"""
         bot: Bot = get_bot()
         if bot:
             logger.info(f"Self_id:{bot.self_id} user_name:{bot.self_id}")
@@ -552,17 +599,32 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         """获取用户(或者群聊用户)信息"""
         raise NotImplementedError
 
+    async def get_account_default_preset_id(self, chat_key: str) -> Optional[int]:
+        """获取 chat_key 所属 QQ 账号的默认人设 ID
+
+        供 `DBChatChannel.get_preset()` 的账号层解析调用。旧格式 chat_key（无账号
+        作用域）返回 None，交由全局默认人设处理。
+        """
+        from .core.account_manager import get_default_preset_id
+
+        self_id = parse_channel_id(self.parse_channel_id(chat_key)).self_id
+        if not self_id:
+            return None
+        return await get_default_preset_id(self_id)
+
     async def get_channel_info(self, channel_id: str) -> PlatformChannel:
         """获取频道信息"""
         chat_type = get_channel_type(channel_id)
+        # 频道信息需由所属账号查询：非本账号的群，查询会失败
+        scoped = parse_channel_id(channel_id)
         if chat_type == ChatType.GROUP:
             try:
-                channel_name = (await get_bot().get_group_info(group_id=int(channel_id.replace("group_", ""))))["group_name"]
+                channel_name = (await get_bot(scoped.self_id).get_group_info(group_id=scoped.target_id_int))["group_name"]
             except Exception as e:
                 logger.error(f"获取群组名称失败: {e!s}")
                 channel_name = channel_id
         elif chat_type == ChatType.PRIVATE:
-            channel_name = (await get_bot().get_stranger_info(user_id=int(channel_id.replace("private_", ""))))["nickname"]
+            channel_name = (await get_bot(scoped.self_id).get_stranger_info(user_id=scoped.target_id_int))["nickname"]
         else:
             channel_name = channel_id
 
@@ -579,13 +641,10 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             bool: 是否成功
         """
         try:
-            bot: Bot = get_bot()
-            db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
-            chat_type = db_chat_channel.chat_type
+            bot, chat_type, gid = await self._resolve_target(chat_key)
             uid = int(target_user_id)
 
             if chat_type is ChatType.GROUP:
-                gid = int(db_chat_channel.channel_id.split("_")[1])
                 await bot.call_api("group_poke", group_id=gid, user_id=uid)
             elif chat_type is ChatType.PRIVATE:
                 await bot.call_api("friend_poke", user_id=uid)
@@ -609,6 +668,9 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             bool: 是否成功设置
         """
         try:
+            # 该接口签名只有 message_id（BaseAdapter 统一契约，7 个适配器共用），
+            # 无法定位账号，故使用默认账号。多账号下对非默认账号的消息设置表态可能失败，
+            # 调用方已做异常兜底，不影响主流程。
             bot: Bot = get_bot()
             await bot.call_api(
                 "set_msg_emoji_like",
